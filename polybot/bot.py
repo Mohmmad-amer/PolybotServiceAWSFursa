@@ -3,6 +3,11 @@ from loguru import logger
 import os
 import time
 from telebot.types import InputFile
+import boto3
+import requests
+import ast
+from collections import Counter
+import json
 
 
 class Bot:
@@ -17,15 +22,18 @@ class Bot:
         time.sleep(0.5)
 
         # set the webhook URL
-        self.telegram_bot_client.set_webhook(url=f'{telegram_chat_url}/{token}/', timeout=60)
+        self.telegram_bot_client.set_webhook(url=f'{telegram_chat_url}/{token}/' ,timeout=60, certificate=open('/home/ubuntu/YOURPUBLIC.pem', 'r'))
+
+        self.prev_path = ""
 
         logger.info(f'Telegram Bot information\n\n{self.telegram_bot_client.get_me()}')
 
     def send_text(self, chat_id, text):
-        self.telegram_bot_client.send_message(chat_id, text)
+        # added timeout 5 sec
+        self.telegram_bot_client.send_message(chat_id, text, timeout=5)
 
     def send_text_with_quote(self, chat_id, text, quoted_msg_id):
-        self.telegram_bot_client.send_message(chat_id, text, reply_to_message_id=quoted_msg_id)
+        self.telegram_bot_client.send_message(chat_id, text, reply_to_message_id=quoted_msg_id, timeout=5)
 
     def is_current_msg_photo(self, msg):
         return 'photo' in msg
@@ -53,10 +61,11 @@ class Bot:
     def send_photo(self, chat_id, img_path):
         if not os.path.exists(img_path):
             raise RuntimeError("Image path doesn't exist")
-
+        # added timeout 5 sec
         self.telegram_bot_client.send_photo(
             chat_id,
-            InputFile(img_path)
+            InputFile(img_path),
+            timeout=5
         )
 
     def handle_message(self, msg):
@@ -69,9 +78,43 @@ class ObjectDetectionBot(Bot):
     def handle_message(self, msg):
         logger.info(f'Incoming message: {msg}')
 
+        images_bucket = os.environ['BUCKET_NAME']
+        s3 = boto3.client('s3')
+
         if self.is_current_msg_photo(msg):
             photo_path = self.download_user_photo(msg)
+            img_name=os.path.basename(photo_path)
 
-            # TODO upload the photo to S3
-            # TODO send a job to the SQS queue
-            # TODO send message to the Telegram end-user (e.g. Your image is being processed. Please wait...)
+            try:
+                s3.upload_file(photo_path, images_bucket, img_name)
+            except Exception as e:
+                logger.error(e)
+
+
+            #  send an HTTP request to the `yolo5` service for prediction
+            # Define the URL and parameters
+
+            try:
+                logger.info('Sending message to SQS')
+                sqs = boto3.client('sqs', region_name='eu-north-1')
+                queue_url = 'https://sqs.eu-north-1.amazonaws.com/700935310038/mohmmad-sqs'
+                message = {
+                    'imgName': os.path.basename(photo_path),
+                    'chat_id': msg['chat']['id']
+                }
+                sqs.send_message(
+                    QueueUrl=queue_url,
+                    MessageBody=json.dumps(message)
+                )
+                logger.info('message sent to SQS')
+            except Exception as e:
+                logger.error(f'Error sending message to SQS: {e}')
+                self.send_text(msg['chat']['id'],
+                               f'Error sending message to SQS: {e}')
+                return
+            except Exception as e:
+                logger.error(f'http request has failed {e}')
+
+    def count_items(self,lst):
+        counts = Counter(lst)
+        return dict(counts)
